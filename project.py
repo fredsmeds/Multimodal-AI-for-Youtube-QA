@@ -152,7 +152,7 @@ for item_metadata, item_embedding in zip(all_items['metadatas'], all_items['embe
 
 
 # ----------------------------Response Generation with Language Detection------------------
-ef generate_multi_query_response(user_query):
+def generate_multi_query_response(user_query):
     # Detect language of the user's input
     detected_language = detect_language(user_query)
     print("Detected language:", detected_language)
@@ -169,18 +169,28 @@ ef generate_multi_query_response(user_query):
         "Answer in the format:\nAnswer: <your response here>"
     )
 
-    # Generate a response using the consolidated context
+    # Generate a response using the consolidated context with streaming enabled
+    response_chunks = []  # Store chunks for final response
+    response_text = ""
+
+    # Streaming API call
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": enhanced_prompt}],
         max_tokens=150,
-        temperature=0.7
+        temperature=0.7,
+        stream=True  # Enable streaming
     )
 
-    # Extract and print the response
-    answer = response['choices'][0]['message']['content'].strip()
-    print("Generated Answer:", answer)
-    return answer
+    # Process each streamed chunk as it arrives
+    for chunk in response:
+        # Each chunk has the format {'choices': [{'delta': {'content': 'text'}}]}
+        chunk_content = chunk['choices'][0].get('delta', {}).get('content', "")
+        response_text += chunk_content  # Append chunk to the full response
+        print(chunk_content, end="")  # Print each chunk immediately for streaming effect
+
+    print("\nGenerated Answer:", response_text)  # Print the final answer
+    return response_text
 
 # ----------------------------Agent Configuration and Memory Setup--------------------------
 
@@ -217,3 +227,34 @@ print(agent.invoke({"input": "Qui est la princesse Zelda?"}))  # French
 print(agent.invoke({"input": "Wer ist Prinzessin Zelda?"}))    # German
 print(agent.invoke({"input": "Quem é a Princesa Zelda?"}))     # Portuguese
 print(agent.invoke({"input": "Who is Princess Zelda?"}))       # English
+
+
+
+# ----------------------------Voice Input and Output Setup---------------------------------------------------------------------------------------
+import speech_recognition as sr
+import pyttsx3
+
+# Initialize the text-to-speech engine
+engine = pyttsx3.init()
+
+def listen_to_voice_input():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Please say something...")
+        audio = recognizer.listen(source)
+        try:
+            # Convert speech to text
+            user_input = recognizer.recognize_google(audio)
+            print(f"You said: {user_input}")
+            return user_input
+        except sr.UnknownValueError:
+            print("Sorry, I didn't understand that.")
+            return None
+        except sr.RequestError:
+            print("Sorry, there's a problem with the speech recognition service.")
+            return None
+
+def speak_text(response_text):
+    # Convert text to speech
+    engine.say(response_text)
+    engine.runAndWait()

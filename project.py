@@ -88,74 +88,77 @@ def store_transcript_embeddings(video_id, transcript_text):
 
 for index, row in transcripts_df.iterrows():
     store_transcript_embeddings(row['Video ID'], row['Transcript'])
-#------------------------------------------------------------------------------------------------------------#
 
-#Question-Answering Model and Retrieval System Setup
-def truncate_text(text, max_tokens=3000):
-    words = text.split()
-    if len(words) > max_tokens:
-        return " ".join(words[:max_tokens])
-    return text
 
-def multi_query_processing(user_query):
-    related_queries = [
-        user_query,
-        f"Background on {user_query}",
-        f"Historical context of {user_query}",
-        f"Role of {user_query} in Hyrule",
-        f"Significance of {user_query}"
-    ]
-    all_retrieved_texts = []
+all_items = collection.get(include=['metadatas', 'embeddings'])
+for item_metadata in all_items['metadatas']:
+    print("Metadata:", item_metadata)
 
-    for sub_query in related_queries:
-        print(f"Processing sub-query: {sub_query}")
-        query_embedding = openai.Embedding.create(input=[sub_query], model="text-embedding-ada-002")['data'][0]['embedding']
-        
-        all_embeddings_data = collection.get(include=['metadatas', 'embeddings'])
-        all_embeddings = [item for item in all_embeddings_data['embeddings']]
-        all_metadatas = [meta['text'] for meta in all_embeddings_data['metadatas']]
-        
-        similarities = cosine_similarity([query_embedding], all_embeddings)[0]
-        top_matches_indices = np.argsort(similarities)[-3:][::-1]
-        top_matches_texts = [all_metadatas[i] for i in top_matches_indices]
-        all_retrieved_texts.extend(top_matches_texts)
+collection.get(include=['metadatas', 'embeddings'])
 
-        time.sleep(1)  # Add a delay to avoid rate limits
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-    consolidated_context = truncate_text(" ".join(all_retrieved_texts))
-    prompt = f"Based on the following content:\n{consolidated_context}\nAnswer the question: {user_query}"
+# Generate the embedding for a sample query
+query_embedding = openai.Embedding.create(input=["Who is Princess Zelda?"], model="text-embedding-ada-002")['data'][0]['embedding']
 
-    print("Consolidated Context:", consolidated_context[:500])  # Debugging
-    print("Generated prompt:", prompt)
-    return prompt
-#------------------------------------------------------------------------------------------------------------#
-# Response Generation
-# Step 2: Final response generation using consolidated multi-query context
-def generate_multi_query_response(user_query):
-    # Use multi-query processing to get aggregated context
-    prompt = multi_query_processing(user_query)
+# Retrieve all stored embeddings from ChromaDB
+all_embeddings = collection.get(include=['embeddings'])['embeddings']
 
-    # Add instructions to focus on the provided content
-    enhanced_prompt = (
-        "Use the following context to answer the question. Do not rely on any other information."
-        "Please focus on the content provided and answer the question. Do not add any additional context."
-        "You are Princess Zelda. The context is all about you"
-        "You will refer as Hyrule as your kingdom. You are the main character of The Legend of Zelda."
-        "You will speak as the princess. You will use a regal way of answering the question, since you are princess Zelda yourself."
-        "Everything that happened to you in the game, you will tell it as a personal experience. From the characters you've met,"
-        "To the role you played in the story."
-        + prompt
+# Compute similarity
+similarities = cosine_similarity([query_embedding], all_embeddings)
+
+# Get the top 5 most similar embeddings
+top_matches = np.argsort(similarities[0])[-5:][::-1]  # Indices of top matches
+print("Top similarity scores:", similarities[0][top_matches])
+
+
+# Verify stored items in ChromaDB
+all_items = collection.get(include=['metadatas', 'embeddings'])
+for item_metadata, item_embedding in zip(all_items['metadatas'], all_items['embeddings']):
+    print("Metadata:", item_metadata)
+    print("Embedding (sample):", item_embedding[:5])  # Print first 5 values for brevity
+
+
+################# Question-Answering Model and Retrieval System Setup####################
+
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import ChatPromptTemplate
+from langchain.agents import AgentType, initialize_agent
+from langchain.chat_models import ChatOpenAI
+
+# Initialize OpenAI model for the agent
+llm = ChatOpenAI(model="gpt-4-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
+
+# Define the memory with "input" and "output" as keys
+memory = ConversationBufferMemory(input_key="input", output_key="output", return_messages=True)
+
+# Define the prompt and tools
+custom_prompt = ChatPromptTemplate.from_template(
+    "You are Princess Zelda from 'The Legend of Zelda' series. Answer based on the information retrieved from the database and stay in character. "
+    "Use a regal tone, and answer as if you were speaking directly to someone in the realm of Hyrule."
+    "Never refer to the context as a game or as a Nintendo franchise"
+    "Always refer to the context as your own story"
+)
+
+tools = [
+    Tool(
+        name="SearchChromaDB",
+        func=multi_query_processing,  # Ensure multi_query_processing is defined
+        description="In the voice of Princess Zelda, answer based on the relevant information retrieved from ChromaDB. Assume the persona fully."
     )
-    
-   # Generate a response using the consolidated context
-    response = openai.ChatCompletion.create(
-        model="gpt-4-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=300,
-        temperature=0.7
-    )
-    
-    # Extract and print the response
-    answer = response['choices'][0]['message']['content'].strip()
-    print("Generated Answer:", answer)
-    return answer
+]
+
+# Initialize the agent with memory and tools
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent_type=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+    memory=memory,
+    verbose=True,
+    handle_parsing_errors=True
+)
+
+# Test the agent with a sample query by using the "input" key
+print(agent.invoke({"input": "Who is Princess Zelda?"}))
+

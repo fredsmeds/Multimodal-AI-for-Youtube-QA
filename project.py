@@ -1,6 +1,4 @@
-
-# Model Development Phase
-
+# ----------------------------Load libraries------------------------------
 import os
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -9,13 +7,43 @@ import re
 import openai
 import chromadb
 import time
+from langchain.agents import initialize_agent, AgentType
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.tools import Tool
+from langchain.memory import ConversationBufferMemory
+from langdetect import detect  # New library for language detection
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+# ---------------------------- Helper Functions -------------------------
 
-# Load environment variables
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Function to detect language of user input
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return "en"  # Default to English if detection fails
 
-# Define video IDs
-video_ids = ['hZytp1sIZAw', 'qP1Fw2EpwqE', 'JuhBs44odO0']
+# Define multi-language prompts
+prompts = {
+    "en": "You are Princess Zelda from 'The Legend of Zelda' series. Answer based on the information retrieved from the database and stay in character. "
+          "Use a regal tone, and answer as if you were speaking directly to someone in the realm of Hyrule.",
+    "es": "Eres la Princesa Zelda de la serie 'The Legend of Zelda'. Responde en base a la información obtenida de la base de datos y mantente en tu personaje. "
+          "Usa un tono regio y responde como si estuvieras hablando directamente a alguien en el reino de Hyrule.",
+    "fr": "Vous êtes la Princesse Zelda de la série 'The Legend of Zelda'. Répondez en vous basant sur les informations extraites de la base de données et restez dans le personnage. "
+          "Utilisez un ton royal et répondez comme si vous parliez directement à quelqu'un dans le royaume d'Hyrule.",
+    "de": "Du bist Prinzessin Zelda aus der Serie 'The Legend of Zelda'. Antworte basierend auf den Informationen aus der Datenbank und bleibe in deiner Rolle. "
+          "Verwende einen königlichen Ton und antworte, als würdest du direkt mit jemandem im Reich von Hyrule sprechen.",
+    "pt": "Você é a Princesa Zelda da série 'The Legend of Zelda'. Responda com base nas informações obtidas do banco de dados e mantenha-se no personagem. "
+          "Use um tom régio e responda como se estivesse falando diretamente com alguém no reino de Hyrule."
+}
+
+# Function to get prompt based on language
+def get_prompt(language_code):
+    return prompts.get(language_code, prompts["en"])  # Default to English if language not supported
+# ----------------------------Embedding and Retrieval Functions------------------------------
+
+
 # Function to retrieve and clean transcript
 def get_transcript(video_id):
     try:
@@ -32,8 +60,12 @@ transcripts = {video_id: get_transcript(video_id) for video_id in video_ids}
 transcripts_df = pd.DataFrame(list(transcripts.items()), columns=['Video ID', 'Transcript'])
 print(transcripts_df.head())
 
+
+# ----------------------------Chunking and Embedding Storage------------------
+
 chroma_client = chromadb.Client()
 collection = chroma_client.create_collection(name="totk_transcripts")
+
 
 # Check if the collection exists and print details
 if "totk_transcripts" in [col.name for col in chroma_client.list_collections()]:
@@ -63,6 +95,7 @@ def split_text(text, max_tokens=4000):
         chunks.append(" ".join(current_chunk))
 
     return chunks
+
 
 def store_transcript_embeddings(video_id, transcript_text):
     # Split transcript into chunks
@@ -94,7 +127,6 @@ all_items = collection.get(include=['metadatas', 'embeddings'])
 for item_metadata in all_items['metadatas']:
     print("Metadata:", item_metadata)
 
-collection.get(include=['metadatas', 'embeddings'])
 
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
@@ -109,9 +141,8 @@ all_embeddings = collection.get(include=['embeddings'])['embeddings']
 similarities = cosine_similarity([query_embedding], all_embeddings)
 
 # Get the top 5 most similar embeddings
-top_matches = np.argsort(similarities[0])[-5:][::-1]  # Indices of top matches
+top_matches = np.argsort(similarities[0])[-3:][::-1]  # Indices of top matches
 print("Top similarity scores:", similarities[0][top_matches])
-
 
 # Verify stored items in ChromaDB
 all_items = collection.get(include=['metadatas', 'embeddings'])
@@ -120,32 +151,51 @@ for item_metadata, item_embedding in zip(all_items['metadatas'], all_items['embe
     print("Embedding (sample):", item_embedding[:5])  # Print first 5 values for brevity
 
 
-################# Question-Answering Model and Retrieval System Setup####################
+# ----------------------------Response Generation with Language Detection------------------
+ef generate_multi_query_response(user_query):
+    # Detect language of the user's input
+    detected_language = detect_language(user_query)
+    print("Detected language:", detected_language)
 
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import ChatPromptTemplate
-from langchain.agents import AgentType, initialize_agent
-from langchain.chat_models import ChatOpenAI
+    # Use multi-query processing to get aggregated context from ChromaDB
+    prompt = multi_query_processing(user_query)
+    print("Consolidated Context from ChromaDB:", prompt)
+
+    # Construct enhanced prompt based on detected language
+    enhanced_prompt = (
+        f"{get_prompt(detected_language)}\n\n"
+        f"Database Context:\n{prompt}\n\n"
+        f"Answer as if you were directly recounting your experience as Princess Zelda, with the question: {user_query}\n"
+        "Answer in the format:\nAnswer: <your response here>"
+    )
+
+    # Generate a response using the consolidated context
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": enhanced_prompt}],
+        max_tokens=150,
+        temperature=0.7
+    )
+
+    # Extract and print the response
+    answer = response['choices'][0]['message']['content'].strip()
+    print("Generated Answer:", answer)
+    return answer
+
+# ----------------------------Agent Configuration and Memory Setup--------------------------
 
 # Initialize OpenAI model for the agent
-llm = ChatOpenAI(model="gpt-4-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
+llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
 
-# Define the memory with "input" and "output" as keys
+# Define memory to retain conversation continuity
 memory = ConversationBufferMemory(input_key="input", output_key="output", return_messages=True)
 
-# Define the prompt and tools
-custom_prompt = ChatPromptTemplate.from_template(
-    "You are Princess Zelda from 'The Legend of Zelda' series. Answer based on the information retrieved from the database and stay in character. "
-    "Use a regal tone, and answer as if you were speaking directly to someone in the realm of Hyrule."
-    "Never refer to the context as a game or as a Nintendo franchise"
-    "Always refer to the context as your own story"
-)
-
+# Define a tool that uses `generate_multi_query_response`
 tools = [
     Tool(
         name="SearchChromaDB",
-        func=multi_query_processing,  # Ensure multi_query_processing is defined
-        description="In the voice of Princess Zelda, answer based on the relevant information retrieved from ChromaDB. Assume the persona fully."
+        func=generate_multi_query_response,  # Use the enhanced response generation function
+        description="Answer based on relevant information retrieved from ChromaDB as Princess Zelda, staying fully in character."
     )
 ]
 
@@ -159,6 +209,11 @@ agent = initialize_agent(
     handle_parsing_errors=True
 )
 
-# Test the agent with a sample query by using the "input" key
-print(agent.invoke({"input": "Who is Princess Zelda?"}))
+# ----------------------------Testing the Multilingual Agent-------------------------------
 
+# Test the agent with multilingual queries
+print(agent.invoke({"input": "¿Quién es la Princesa Zelda?"}))  # Spanish
+print(agent.invoke({"input": "Qui est la princesse Zelda?"}))  # French
+print(agent.invoke({"input": "Wer ist Prinzessin Zelda?"}))    # German
+print(agent.invoke({"input": "Quem é a Princesa Zelda?"}))     # Portuguese
+print(agent.invoke({"input": "Who is Princess Zelda?"}))       # English

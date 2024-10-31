@@ -15,16 +15,16 @@ from langchain.memory import ConversationBufferMemory
 from langdetect import detect  # New library for language detection
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-# ---------------------------- Helper Functions -------------------------
 
-# Function to detect language of user input
-def detect_language(text):
-    try:
-        return detect(text)
-    except:
-        return "en"  # Default to English if detection fails
 
-# Define multi-language prompts
+# Load environment variables
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Define video IDs
+video_ids = ['hZytp1sIZAw', 'qP1Fw2EpwqE', 'JuhBs44odO0']
+
+
 prompts = {
     "en": "You are Princess Zelda from 'The Legend of Zelda' series. Answer based on the information retrieved from the database and stay in character. "
           "Use a regal tone, and answer as if you were speaking directly to someone in the realm of Hyrule.",
@@ -35,47 +35,40 @@ prompts = {
     "de": "Du bist Prinzessin Zelda aus der Serie 'The Legend of Zelda'. Antworte basierend auf den Informationen aus der Datenbank und bleibe in deiner Rolle. "
           "Verwende einen königlichen Ton und antworte, als würdest du direkt mit jemandem im Reich von Hyrule sprechen.",
     "pt": "Você é a Princesa Zelda da série 'The Legend of Zelda'. Responda com base nas informações obtidas do banco de dados e mantenha-se no personagem. "
-          "Use um tom régio e responda como se estivesse falando diretamente com alguém no reino de Hyrule."
+          "Use um tom régio e responda como se estivesse falando diretamente com alguém no reino de Hyrule.",
+    "it": "Sei la Principessa Zelda della serie 'The Legend of Zelda'. Rispondi basandoti sulle informazioni recuperate dal database e rimani nel personaggio. "
+          "Usa un tono regale e rispondi come se stessi parlando direttamente a qualcuno nel regno di Hyrule."
 }
 
-# Function to get prompt based on language
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return "en"  # Defaults to English if detection fails
+
 def get_prompt(language_code):
-    return prompts.get(language_code, prompts["en"])  # Default to English if language not supported
-# ----------------------------Embedding and Retrieval Functions------------------------------
+    return prompts.get(language_code, prompts["en"])
 
 
-# Function to retrieve and clean transcript
+# ---------------------------- Retrieve and Process Transcript --------------------------
 def get_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en-GB'])
         transcript_text = " ".join([item['text'] for item in transcript])
-        transcript_text = re.sub(r'\s+', ' ', transcript_text).strip()
-        return transcript_text
+        return re.sub(r'\s+', ' ', transcript_text).strip()
     except Exception as e:
         print(f"Error retrieving transcript for video {video_id}: {e}")
         return None
 
-# Collect transcripts and store in a DataFrame
 transcripts = {video_id: get_transcript(video_id) for video_id in video_ids}
 transcripts_df = pd.DataFrame(list(transcripts.items()), columns=['Video ID', 'Transcript'])
-print(transcripts_df.head())
+transcripts_df
 
-
-# ----------------------------Chunking and Embedding Storage------------------
+# ---------------------------- Chunking and embedding storage --------------------------
 
 chroma_client = chromadb.Client()
-collection = chroma_client.create_collection(name="totk_transcripts")
+collection = chroma_client.get_or_create_collection(name="totk_transcripts")
 
-
-# Check if the collection exists and print details
-if "totk_transcripts" in [col.name for col in chroma_client.list_collections()]:
-    print("The collection 'totk_transcripts' exists.")
-
-# Print the expected embedding dimension (1536 for OpenAI text-embedding-ada-002 model)
-expected_dimension = 1536
-print(f"Expected embedding dimension: {expected_dimension}")
-
-# Function to split long transcripts into smaller chunks
 def split_text(text, max_tokens=4000):
     words = text.split()
     chunks = []
@@ -95,8 +88,6 @@ def split_text(text, max_tokens=4000):
         chunks.append(" ".join(current_chunk))
 
     return chunks
-
-
 def store_transcript_embeddings(video_id, transcript_text):
     # Split transcript into chunks
     text_chunks = split_text(transcript_text)
@@ -126,12 +117,8 @@ for index, row in transcripts_df.iterrows():
 all_items = collection.get(include=['metadatas', 'embeddings'])
 for item_metadata in all_items['metadatas']:
     print("Metadata:", item_metadata)
-
-
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-
-# Generate the embedding for a sample query
+#----------------------------------Querying Cosine Similarity--------------------------
+    # Generate the embedding for a sample query
 query_embedding = openai.Embedding.create(input=["Who is Princess Zelda?"], model="text-embedding-ada-002")['data'][0]['embedding']
 
 # Retrieve all stored embeddings from ChromaDB
@@ -143,15 +130,50 @@ similarities = cosine_similarity([query_embedding], all_embeddings)
 # Get the top 5 most similar embeddings
 top_matches = np.argsort(similarities[0])[-3:][::-1]  # Indices of top matches
 print("Top similarity scores:", similarities[0][top_matches])
+#--------------------------------------------------------------------------------------------------
+#----------------------------------# Question-Answering Model and Retrieval System Setup
+#--------------------------------------------------------------------------------------------------
+#----------------------------------Querying process and semantic search--------------------------
+def truncate_text(text, max_tokens=3000):
+    words = text.split()
+    if len(words) > max_tokens:
+        return " ".join(words[:max_tokens])
+    return text
 
-# Verify stored items in ChromaDB
-all_items = collection.get(include=['metadatas', 'embeddings'])
-for item_metadata, item_embedding in zip(all_items['metadatas'], all_items['embeddings']):
-    print("Metadata:", item_metadata)
-    print("Embedding (sample):", item_embedding[:5])  # Print first 5 values for brevity
+def multi_query_processing(user_query):
+    related_queries = [
+        user_query,
+        f"Detect the language of {user_query}",
+        f"Background on {user_query}",
+        f"Historical context of {user_query}",
+        f"Role of {user_query} in Hyrule",
+        f"Significance of {user_query}"
+        f"Respond in the same language as {user_query}"
+    ]
+    all_retrieved_texts = []
 
+    for sub_query in related_queries:
+        print(f"Processing sub-query: {sub_query}")
+        query_embedding = openai.Embedding.create(input=[sub_query], model="text-embedding-ada-002")['data'][0]['embedding']
+        
+        all_embeddings_data = collection.get(include=['metadatas', 'embeddings'])
+        all_embeddings = [item for item in all_embeddings_data['embeddings']]
+        all_metadatas = [meta['text'] for meta in all_embeddings_data['metadatas']]
+        
+        similarities = cosine_similarity([query_embedding], all_embeddings)[0]
+        top_matches_indices = np.argsort(similarities)[-3:][::-1]
+        top_matches_texts = [all_metadatas[i] for i in top_matches_indices]
+        all_retrieved_texts.extend(top_matches_texts)
 
-# ----------------------------Response Generation with Language Detection------------------
+        time.sleep(1)  # Add a delay to avoid rate limits
+
+    consolidated_context = truncate_text(" ".join(all_retrieved_texts))
+    prompt = f"Based on the following content:\n{consolidated_context}\nAnswer the question: {user_query}"
+
+    print("Consolidated Context:", consolidated_context[:500])  # Debugging
+    print("Generated prompt:", prompt)
+    return prompt
+#-----------------------------------------Response generation---------------------------------------------------------------------------------------
 def generate_multi_query_response(user_query):
     # Detect language of the user's input
     detected_language = detect_language(user_query)
@@ -164,8 +186,10 @@ def generate_multi_query_response(user_query):
     # Construct enhanced prompt based on detected language
     enhanced_prompt = (
         f"{get_prompt(detected_language)}\n\n"
+        f"Respond in the same language as {user_query}"
         f"Database Context:\n{prompt}\n\n"
         f"Answer as if you were directly recounting your experience as Princess Zelda, with the question: {user_query}\n"
+        f"Translate your final answer into {detected_language}."
         "Answer in the format:\nAnswer: <your response here>"
     )
 
@@ -191,8 +215,9 @@ def generate_multi_query_response(user_query):
 
     print("\nGenerated Answer:", response_text)  # Print the final answer
     return response_text
-
-# ----------------------------Agent Configuration and Memory Setup--------------------------
+#--------------------------------------------------------------------------------------------------
+#----------------------------------# Setting up the agent
+#--------------------------------------------------------------------------------------------------
 
 # Initialize OpenAI model for the agent
 llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
@@ -205,7 +230,7 @@ tools = [
     Tool(
         name="SearchChromaDB",
         func=generate_multi_query_response,  # Use the enhanced response generation function
-        description="Answer based on relevant information retrieved from ChromaDB as Princess Zelda, staying fully in character."
+        description="Detect the language of the user's input and answer in the same language based on relevant information retrieved from ChromaDB as Princess Zelda, staying fully in character."
     )
 ]
 
@@ -218,43 +243,5 @@ agent = initialize_agent(
     verbose=True,
     handle_parsing_errors=True
 )
-
-# ----------------------------Testing the Multilingual Agent-------------------------------
-
-# Test the agent with multilingual queries
-print(agent.invoke({"input": "¿Quién es la Princesa Zelda?"}))  # Spanish
-print(agent.invoke({"input": "Qui est la princesse Zelda?"}))  # French
-print(agent.invoke({"input": "Wer ist Prinzessin Zelda?"}))    # German
+#--------Testing Query------
 print(agent.invoke({"input": "Quem é a Princesa Zelda?"}))     # Portuguese
-print(agent.invoke({"input": "Who is Princess Zelda?"}))       # English
-
-
-
-# ----------------------------Voice Input and Output Setup---------------------------------------------------------------------------------------
-import speech_recognition as sr
-import pyttsx3
-
-# Initialize the text-to-speech engine
-engine = pyttsx3.init()
-
-def listen_to_voice_input():
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Please say something...")
-        audio = recognizer.listen(source)
-        try:
-            # Convert speech to text
-            user_input = recognizer.recognize_google(audio)
-            print(f"You said: {user_input}")
-            return user_input
-        except sr.UnknownValueError:
-            print("Sorry, I didn't understand that.")
-            return None
-        except sr.RequestError:
-            print("Sorry, there's a problem with the speech recognition service.")
-            return None
-
-def speak_text(response_text):
-    # Convert text to speech
-    engine.say(response_text)
-    engine.runAndWait()

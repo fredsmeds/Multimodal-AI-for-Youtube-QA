@@ -7,6 +7,8 @@ import re
 import openai
 import chromadb
 import time
+import whisper
+import gradio as gr
 from langchain.agents import initialize_agent, AgentType
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
@@ -15,16 +17,18 @@ from langchain.memory import ConversationBufferMemory
 from langdetect import detect  # New library for language detection
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-
-
-# Load environment variables
+#----------------------------------------------------------------
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+
+# Load Whisper model for audio transcription
+whisper_model = whisper.load_model("base")
+
+
 # Define video IDs
 video_ids = ['hZytp1sIZAw', 'qP1Fw2EpwqE', 'JuhBs44odO0']
-
-
+#----------------------------------------------------------------
 prompts = {
     "en": "You are Princess Zelda from 'The Legend of Zelda' series. Answer based on the information retrieved from the database and stay in character. "
           "Use a regal tone, and answer as if you were speaking directly to someone in the realm of Hyrule.",
@@ -48,9 +52,7 @@ def detect_language(text):
 
 def get_prompt(language_code):
     return prompts.get(language_code, prompts["en"])
-
-
-# ---------------------------- Retrieve and Process Transcript --------------------------
+#-------------------------------------------------------------------
 def get_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en-GB'])
@@ -63,9 +65,17 @@ def get_transcript(video_id):
 transcripts = {video_id: get_transcript(video_id) for video_id in video_ids}
 transcripts_df = pd.DataFrame(list(transcripts.items()), columns=['Video ID', 'Transcript'])
 transcripts_df
+#---------------------------------------------------------------------
+# Save all transcripts to a single .txt file
+with open("transcripts.txt", "w", encoding="utf-8") as file:
+    for index, row in transcripts_df.iterrows():
+        file.write(f"Video ID: {row['Video ID']}\n")
+        file.write("Transcript:\n")
+        file.write(row['Transcript'] + "\n")
+        file.write("-" * 80 + "\n\n")  # Separator between transcripts
 
-# ---------------------------- Chunking and embedding storage --------------------------
-
+print("All transcripts have been saved to transcripts.txt.")
+#---------------------------------------------------------------------
 chroma_client = chromadb.Client()
 collection = chroma_client.get_or_create_collection(name="totk_transcripts")
 
@@ -88,6 +98,7 @@ def split_text(text, max_tokens=4000):
         chunks.append(" ".join(current_chunk))
 
     return chunks
+#--------------------------------------------------------------------
 def store_transcript_embeddings(video_id, transcript_text):
     # Split transcript into chunks
     text_chunks = split_text(transcript_text)
@@ -117,8 +128,9 @@ for index, row in transcripts_df.iterrows():
 all_items = collection.get(include=['metadatas', 'embeddings'])
 for item_metadata in all_items['metadatas']:
     print("Metadata:", item_metadata)
-#----------------------------------Querying Cosine Similarity--------------------------
-    # Generate the embedding for a sample query
+#--------------------------------------------------------------------
+#Checking Cosine Similarity
+
 query_embedding = openai.Embedding.create(input=["Who is Princess Zelda?"], model="text-embedding-ada-002")['data'][0]['embedding']
 
 # Retrieve all stored embeddings from ChromaDB
@@ -130,10 +142,8 @@ similarities = cosine_similarity([query_embedding], all_embeddings)
 # Get the top 5 most similar embeddings
 top_matches = np.argsort(similarities[0])[-3:][::-1]  # Indices of top matches
 print("Top similarity scores:", similarities[0][top_matches])
-#--------------------------------------------------------------------------------------------------
-#----------------------------------# Question-Answering Model and Retrieval System Setup
-#--------------------------------------------------------------------------------------------------
-#----------------------------------Querying process and semantic search--------------------------
+#-------------------------------------------------------------------
+#QA Model and Retrieval System Setup
 def truncate_text(text, max_tokens=3000):
     words = text.split()
     if len(words) > max_tokens:
@@ -173,7 +183,7 @@ def multi_query_processing(user_query):
     print("Consolidated Context:", consolidated_context[:500])  # Debugging
     print("Generated prompt:", prompt)
     return prompt
-#-----------------------------------------Response generation---------------------------------------------------------------------------------------
+#-------------------------------------------------------------------
 def generate_multi_query_response(user_query):
     # Detect language of the user's input
     detected_language = detect_language(user_query)
@@ -187,6 +197,7 @@ def generate_multi_query_response(user_query):
     enhanced_prompt = (
         f"{get_prompt(detected_language)}\n\n"
         f"Respond in the same language as {user_query}"
+        f"Please answer strictly based on the following information retrieved from the database:\n{prompt}\n\n"
         f"Database Context:\n{prompt}\n\n"
         f"Answer as if you were directly recounting your experience as Princess Zelda, with the question: {user_query}\n"
         f"Translate your final answer into {detected_language}."
@@ -215,9 +226,10 @@ def generate_multi_query_response(user_query):
 
     print("\nGenerated Answer:", response_text)  # Print the final answer
     return response_text
-#--------------------------------------------------------------------------------------------------
-#----------------------------------# Setting up the agent
-#--------------------------------------------------------------------------------------------------
+
+print(generate_multi_query_response("Quien era Sonia?"))
+#-------------------------------------------------------------------------
+#Agent Config and Memory Setup:
 
 # Initialize OpenAI model for the agent
 llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
@@ -243,5 +255,36 @@ agent = initialize_agent(
     verbose=True,
     handle_parsing_errors=True
 )
-#--------Testing Query------
-print(agent.invoke({"input": "Quem é a Princesa Zelda?"}))     # Portuguese
+agent.run({"input": "Quem és?"})   # Portuguese
+
+#---------------------------------------------------------------
+#Voice Interaction
+
+def handle_input(input_text=None, input_audio=None):
+    # Check if audio is provided, prioritize it over text input
+    if input_audio:
+        # Transcribe audio
+        transcription = whisper_model.transcribe(input_audio)["text"]
+    elif input_text:
+        transcription = input_text  # Use text input directly if no audio
+    else:
+        return "Please provide either text input or audio input."
+
+    # Process the transcription with LangChain agent
+    response = agent.run(transcription)
+    return response
+
+# Set up Gradio Interface
+gr_interface = gr.Interface(
+    fn=handle_input,
+    inputs=[
+        gr.Textbox(label="What brings you here, beloved Hyrulean?"),  # Text input
+        gr.Audio(source="microphone", type="filepath", label="Or record your question")  # Audio input
+    ],
+    outputs="text",
+    title="The Sheikah Slate",
+    description="Ask me anything about the events of Tears of the Kingdom"
+)
+
+# Launch Gradio app
+gr_interface.launch()

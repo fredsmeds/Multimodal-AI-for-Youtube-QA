@@ -1,4 +1,3 @@
-# ----------------------------Load libraries------------------------------
 import os
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -105,14 +104,13 @@ def store_transcript_embeddings(video_id, transcript_text):
     print("Text chunks:", text_chunks)  # Debug to check chunks
 
     for i, chunk in enumerate(text_chunks):
+        # Generate embedding for each chunk
+        embedding = openai.Embedding.create(input=[chunk], model="text-embedding-ada-002")['data'][0]['embedding']
+        
+        # Define a unique ID
+        chunk_id = f"{video_id}_chunk_{i}"
+        
         try:
-            # Generate embedding for each chunk
-            embedding = openai.Embedding.create(input=[chunk], model="text-embedding-ada-002")['data'][0]['embedding']
-            
-            # Define a unique ID
-            chunk_id = f"{video_id}_chunk_{i}"
-            
-            # Store in ChromaDB
             collection.add(
                 ids=[chunk_id],
                 embeddings=[embedding],
@@ -120,7 +118,6 @@ def store_transcript_embeddings(video_id, transcript_text):
             )
             print(f"Stored chunk {chunk_id} successfully.")
         except Exception as e:
-            # Log the error but continue processing
             print(f"Error storing chunk {chunk_id}: {e}")
 
 for index, row in transcripts_df.iterrows():
@@ -131,19 +128,7 @@ all_items = collection.get(include=['metadatas', 'embeddings'])
 for item_metadata in all_items['metadatas']:
     print("Metadata:", item_metadata)
 #--------------------------------------------------------------------
-#Checking Cosine Similarity
-
-query_embedding = openai.Embedding.create(input=["Who is Princess Zelda?"], model="text-embedding-ada-002")['data'][0]['embedding']
-
-# Retrieve all stored embeddings from ChromaDB
-all_embeddings = collection.get(include=['embeddings'])['embeddings']
-
-# Compute similarity
-similarities = cosine_similarity([query_embedding], all_embeddings)
-
-# Get the top 5 most similar embeddings
-top_matches = np.argsort(similarities[0])[-3:][::-1]  # Indices of top matches
-print("Top similarity scores:", similarities[0][top_matches])
+#QUESTION AND ANSWERING MODEL AND CONFIGURATION OF THE RETRIEVER
 #-------------------------------------------------------------------
 #QA Model and Retrieval System Setup
 def truncate_text(text, max_tokens=3000):
@@ -154,6 +139,7 @@ def truncate_text(text, max_tokens=3000):
 
 def multi_query_processing(user_query):
     try:
+        # Define related sub-queries for context
         related_queries = [
             user_query,
             f"Detect the language of {user_query}",
@@ -162,26 +148,36 @@ def multi_query_processing(user_query):
             f"Role of {user_query} in Hyrule",
             f"Significance of {user_query} in Hyrule"
         ]
-        all_retrieved_texts = []
+        
+        # Batch embedding generation for all sub-queries
+        print("Generating embeddings for all sub-queries in a single call...")
+        query_embeddings = openai.Embedding.create(
+            input=related_queries, 
+            model="text-embedding-ada-002"
+        )['data']
+        
+        # Retrieve all stored embeddings from ChromaDB once
+        all_embeddings_data = collection.get(include=['metadatas', 'embeddings'])
+        all_embeddings = np.array([item for item in all_embeddings_data['embeddings']])
+        all_metadatas = [meta['text'] for meta in all_embeddings_data['metadatas']]
+        
+        # Compute similarity for each query embedding against all ChromaDB embeddings
+        aggregated_retrieved_texts = []
+        for i, query_embedding in enumerate(query_embeddings):
+            query_vector = np.array(query_embedding['embedding']).reshape(1, -1)
+            similarities = cosine_similarity(query_vector, all_embeddings)[0]
+            
+            # Get top matches for this particular query
+            top_matches_indices = np.argsort(similarities)[-3:][::-1]  # Top 3 matches
+            top_matches_texts = [all_metadatas[idx] for idx in top_matches_indices]
+            
+            # Aggregate texts
+            aggregated_retrieved_texts.extend(top_matches_texts)
 
-        for sub_query in related_queries:
-            print(f"Processing sub-query: {sub_query}")
-            try:
-                query_embedding = openai.Embedding.create(input=[sub_query], model="text-embedding-ada-002")['data'][0]['embedding']
-                all_embeddings_data = collection.get(include=['metadatas', 'embeddings'])
-                all_embeddings = [item for item in all_embeddings_data['embeddings']]
-                all_metadatas = [meta['text'] for meta in all_embeddings_data['metadatas']]
-                
-                similarities = cosine_similarity([query_embedding], all_embeddings)[0]
-                top_matches_indices = np.argsort(similarities)[-3:][::-1]
-                top_matches_texts = [all_metadatas[i] for i in top_matches_indices]
-                all_retrieved_texts.extend(top_matches_texts)
+            print(f"Top matches for sub-query {related_queries[i]}: {top_matches_texts}")
 
-            except Exception as e:
-                print(f"Error processing sub-query '{sub_query}': {e}")
-                continue
-
-        consolidated_context = truncate_text(" ".join(all_retrieved_texts))
+        # Consolidate context from top results
+        consolidated_context = truncate_text(" ".join(aggregated_retrieved_texts))
         prompt = f"Based on the following content:\n{consolidated_context}\nAnswer the question: {user_query}"
         print("Generated prompt:", prompt)
         return prompt
@@ -189,61 +185,55 @@ def multi_query_processing(user_query):
     except Exception as e:
         print(f"Error in multi-query processing: {e}")
         return "An error occurred while retrieving information. Please try again."
-
-
-    print("Consolidated Context:", consolidated_context[:500])  # Debugging
-    print("Generated prompt:", prompt)
-    return prompt
 #-------------------------------------------------------------------
 def generate_multi_query_response(user_query):
-    try:
-        # Detect language of the user's input
-        detected_language = detect_language(user_query)
-        print("Detected language:", detected_language)
+    # Detect language of the user's input
+    detected_language = detect_language(user_query)
+    print("Detected language:", detected_language)
 
-        # Use multi-query processing to get aggregated context from ChromaDB
-        prompt = multi_query_processing(user_query)
-        print("Consolidated Context from ChromaDB:", prompt)
+    # Use multi-query processing to get aggregated context from ChromaDB
+    prompt = multi_query_processing(user_query)
+    print("Consolidated Context from ChromaDB:", prompt)
 
-        # Construct enhanced prompt based on detected language
-        enhanced_prompt = (
-            f"{get_prompt(detected_language)}\n\n"
-            f"Database Context:\n{prompt}\n\n"
-            f"Answer as if you were directly recounting your experience as Princess Zelda, with the question: {user_query}\n"
-            f"Translate your final answer into {detected_language}."
-            "Answer in the format:\nAnswer: <your response here>"
-        )
+    # Construct enhanced prompt based on detected language
+    enhanced_prompt = (
+        f"{get_prompt(detected_language)}\n\n"
+        f"Respond in the same language as {user_query}"
+        f"Please answer strictly based on the following information retrieved from the database:\n{prompt}\n\n"
+        f"Database Context:\n{prompt}\n\n"
+        f"Answer as if you were directly recounting your experience as Princess Zelda, with the question: {user_query}\n"
+        f"Translate your final answer into {detected_language}."
+        "Answer in the format:\nAnswer: <your response here>"
+    )
 
-        # Generate a response using the consolidated context with streaming enabled
-        response_chunks = []  # Store chunks for final response
-        response_text = ""
+    # Generate a response using the consolidated context with streaming enabled
+    response_chunks = []  # Store chunks for final response
+    response_text = ""
 
-        # Streaming API call
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": enhanced_prompt}],
-            max_tokens=150,
-            temperature=0.7,
-            stream=True  # Enable streaming
-        )
+    # Streaming API call
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": enhanced_prompt}],
+        max_tokens=150,
+        temperature=0.7,
+        stream=True  # Enable streaming
+    )
 
-        # Process each streamed chunk as it arrives
-        for chunk in response:
-            chunk_content = chunk['choices'][0].get('delta', {}).get('content', "")
-            response_text += chunk_content  # Append chunk to the full response
-            print(chunk_content, end="")  # Print each chunk immediately for streaming effect
+    # Process each streamed chunk as it arrives
+    for chunk in response:
+        # Each chunk has the format {'choices': [{'delta': {'content': 'text'}}]}
+        chunk_content = chunk['choices'][0].get('delta', {}).get('content', "")
+        response_text += chunk_content  # Append chunk to the full response
+        print(chunk_content, end="")  # Print each chunk immediately for streaming effect
 
-        print("\nGenerated Answer:", response_text)  # Print the final answer
-        return response_text
-
-    except Exception as e:
-        print(f"Error generating response: {e}")
-        return "An error occurred while generating a response. Please try again later."
-
+    print("\nGenerated Answer:", response_text)  # Print the final answer
+    return response_text
 
 print(generate_multi_query_response("Quien era Sonia?"))
+
 #-------------------------------------------------------------------------
 #Agent Config and Memory Setup:
+
 # Initialize OpenAI model for the agent
 llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -268,12 +258,6 @@ agent = initialize_agent(
     verbose=True,
     handle_parsing_errors=True
 )
-
-# Function to limit memory buffer size
-def limit_memory_buffer(memory, max_length=10):
-    if len(memory.buffer) > max_length:
-        # Keep only the last `max_length` messages
-        memory.buffer = memory.buffer[-max_length:]
 agent.run({"input": "Quem és?"})   # Portuguese
 
 #---------------------------------------------------------------
@@ -289,15 +273,9 @@ def handle_input(input_text=None, input_audio=None):
         return "Please provide either text input or audio input."
 
     # Process the transcription with LangChain agent
-    try:
-        response = agent.run(transcription)
-        # Limit memory to avoid unbounded growth
-        limit_memory_buffer(memory)
-    except Exception as e:
-        print(f"Error during agent response generation: {e}")
-        return "An error occurred while generating a response. Please try again."
-
+    response = agent.run(transcription)
     return response
+
 #---------------------------------------------------------------
 # Set up Gradio Interface
 gr_interface = gr.Interface(
@@ -313,4 +291,3 @@ gr_interface = gr.Interface(
 
 # Launch Gradio app
 gr_interface.launch()
-
